@@ -1,9 +1,14 @@
 import time
+from copy import deepcopy
+
 from helpers import get_logger
 import requests
 from bs4 import BeautifulSoup
 from wiktionaryparser import WiktionaryParser
 import re
+from selenium import webdriver
+import numpy as np
+
 
 columns = [
     'GermanEntry',
@@ -13,11 +18,11 @@ columns = [
     'SecondaryEnglishMeaning',
     'RoughEnglishSentence'
 ]
-LINGUEE_URL = 'https://www.linguee.com/english-german/search?source=german&query={}'
 logger = get_logger(__name__)
 
 wiktionary_parser = WiktionaryParser()
 wiktionary_parser.set_default_language('english')
+selenium_driver = webdriver.PhantomJS()
 
 
 def get_sentence(tag):
@@ -34,30 +39,33 @@ def filter_sentence_tags(tags):
             return tag
 
 
-def filter_word(word):
-    articles = ['der', 'das', 'dir', 'die', 'dem', 'den', 'diese', 'diesem']
-    prepositions = ['aus', 'für', 'bis', 'in', 'vor', 'an', 'mit', 'über', 'unter', 'nach', 'seit', 'von', 'zu', 'bei',
-                    'nach', 'um']
-
-    return ' '.join([part for part in word.split(' ') if part not in articles + prepositions])
-
-
-def word_to_request(word, destination='Linguee'):
-    return word.replace(
-        ' ',
-        {
-            'Linguee': '+',
-            'Wiktionary': '_'
-        }[destination]
-    )
+def filter_word(word, filter_parts=None):
+    if filter_parts is None:
+        filter_parts = ['articles']
+    parts = {
+        'articles': ['der', 'das', 'dir', 'die', 'dem', 'den', 'diese', 'diesem'],
+        'prepositions': ['aus', 'für', 'bis', 'in', 'vor', 'an', 'mit', 'über', 'unter', 'nach', 'seit', 'von', 'zu', 'bei', 'nach', 'um']
+    }
+    filter_set = set()
+    for part, words in parts.items():
+        if part in filter_parts:
+            filter_set.update(words)
+    return ' '.join([part for part in word.split(' ') if part not in filter_set])
 
 
-def get_soup(word):
-    delay, o_delay = 0, 3
+def format_sentence(sentence):
+    return re.sub(r'[;\-"«»\[\]]', '', sentence.strip()) + '.'
+
+
+def get_soup(word, url, symbol=None):
+    delay, o_delay = 0, 2
     status_code = None
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/75.0.3770.90 Chrome/75.0.3770.90 Safari/537.36'
+    }
 
     while status_code != 200:
-        if delay == 30:
+        if delay == o_delay * 10:
             return None
 
         if status_code:
@@ -65,18 +73,106 @@ def get_soup(word):
             time.sleep(delay)
             logger.debug(f"Got {status_code}. Waiting for {delay} seconds.")
 
-        request_text = word_to_request(word, destination='Linguee')
-        request = requests.get(LINGUEE_URL.format(request_text))
+        if symbol:
+            word = word.replace(' ', symbol)
+        request = requests.get(url=url.format(word), headers=headers)
 
         status_code = request.status_code
         if status_code != 200:
             logger.warning(f"Faced with request status code {status_code}")
 
-    return BeautifulSoup(request.text, features="lxml")
+    return BeautifulSoup(request.text, features="html5lib")
+
+
+def scrap_dictcc(word):
+    dictcc_url = 'https://www.dict.cc/german-english/{}.html'
+    soup = get_soup(word, dictcc_url, '+')
+    german_entry = word
+    german_sample_sentence, rough_english_sentence, english_meaning, english_secondary_meanings = [''] * 4
+    return [german_entry, german_sample_sentence, ' ', english_meaning, english_secondary_meanings,
+            rough_english_sentence]
+
+
+def strip_tag(tag):
+    return tag.text.strip()
+
+
+def scrap_reverso(word):
+    german_entry = word
+    german_sample_sentence, rough_english_sentence, english_meaning, english_secondary_meanings = [''] * 4
+
+    reverso_url = 'https://context.reverso.net/translation/german-english/{}'
+    request_text = word.replace(' ', '+')
+
+    variants = list(dict.fromkeys(
+        [
+            filter_word(word, ['articles']).replace(' ', '+'),
+            filter_word(word, ['articles', 'prepositions']).replace(' ', '+'),
+            request_text,
+            request_text.capitalize(),
+            request_text.lower(),
+        ]
+    ).keys())
+
+    warning_message = f"Couldn't find appropriate variant for {word} with Reverso.Context. Tried {', '.join(variants)}"
+
+    while True:
+        variant = variants.pop(0)
+        # selenium_driver.get(reverso_url.format(variant))
+        # innerHTML = selenium_driver.execute_script("return document.body.innerHTML")
+        # soup = BeautifulSoup(innerHTML, "lxml")
+        soup = BeautifulSoup(requests.get(reverso_url.format(variant), headers={
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/75.0.3770.90 Chrome/75.0.3770.90 Safari/537.36'
+        }).text, "lxml")
+
+        button = soup.find("button", {"data-index": "0"})
+        if not button:
+            english_meanings_tags = soup.findAll("div", {"class": "translation ltr dict no-pos"})
+            if len(english_meanings_tags) == 0 and len(variants) == 0:
+                logger.warning(warning_message)
+                return None
+        else:
+            attribute = button.attrs['data-pos'].replace('.', '')
+            first_meaning_tag = soup.find("a", {"class": f"translation ltr dict first {attribute}"})
+            other_meanings_tags = soup.findAll("a", {"class": f"translation ltr dict {attribute}"})
+            other_meanings_tags += soup.findAll("a", {"class": "translation ltr dict no-pos"})
+            if not first_meaning_tag:
+                english_meanings_tags = other_meanings_tags
+            else:
+                english_meanings_tags = [first_meaning_tag] + other_meanings_tags
+
+        if len(english_meanings_tags) > 0:
+            break
+
+        elif len(english_meanings_tags) == 0 and len(variants) == 0:
+            logger.warning(warning_message)
+            return None
+
+    german_sample_sentences_tags = soup.findAll("div", {"class": "src ltr"})
+    rough_english_sentences_tags = soup.findAll("div", {"class": "trg ltr"})
+
+    if len(german_sample_sentences_tags) == 0 or len(rough_english_sentences_tags) == 0 or len(english_meanings_tags) == 0:
+        logger.warning(warning_message)
+        return None
+
+    for german_sample_sentence_tag, rough_english_sentence_tag in zip(german_sample_sentences_tags, rough_english_sentences_tags):
+        german_sample_sentence = strip_tag(german_sample_sentence_tag)
+        rough_english_sentence = strip_tag(rough_english_sentence_tag)
+        if len(german_sample_sentence.split(' ')) >= 3 and len(rough_english_sentence.split(' ')) >= 3:
+            break
+
+    english_meanings = [strip_tag(english_meaning_tag) for english_meaning_tag in english_meanings_tags]
+
+
+    english_meaning = english_meanings[0]
+    english_secondary_meanings = ', '.join(english_meanings[1:5])
+
+    return [german_entry, german_sample_sentence, ' ', english_meaning, english_secondary_meanings, rough_english_sentence]
 
 
 def scrap_linguee(word):
-    soup = get_soup(word)
+    linguee_url = 'https://www.linguee.com/english-german/search?source=german&query={}'
+    soup = get_soup(filter_word(word), linguee_url, '+')
     german_entry = word
 
     german_sentence_tags = soup.findAll("span", {"class": "tag_s"})
@@ -98,28 +194,28 @@ def scrap_linguee(word):
     english_meaning = english_meanings[0]
     english_secondary_meanings = ', '.join(english_meanings[1:])
 
-    return [german_entry, german_sample_sentence, ' ', english_meaning, english_secondary_meanings, rough_english_sentence]
+    return [german_entry, german_sample_sentence, ' ', english_meaning, english_secondary_meanings,
+            rough_english_sentence]
 
 
 def scrap_wiktionary(word):
-    time.sleep(2)
     german_entry = word
     german_sample_sentence, rough_english_sentence, english_meaning, english_secondary_meanings = [''] * 4
 
-
-    # CHANGE IT!
-    request_text = word_to_request(word, destination='Wiktionary')
+    request_text = word.replace(' ', '_')
     variants = [
         request_text,
         request_text.capitalize(),
         request_text.lower(),
     ]
-    definitions = []
 
+    definitions = []
     for variant in variants:
-        definitions = wiktionary_parser.fetch(variant, 'german')[0]['definitions']
-        if len(definitions) > 0:
-            break
+        fetch = wiktionary_parser.fetch(variant, 'german')
+        if len(fetch) > 0:
+            definitions = fetch[0]['definitions']
+            if len(definitions) > 0:
+                break
 
     if len(definitions) == 0:
         return None
@@ -132,10 +228,11 @@ def scrap_wiktionary(word):
             if 'examples' in definition.keys():
                 examples = definition['examples']
                 for example in examples:
-                    sentences = list(filter(lambda x: len(x.split(' ')) > 2,  example.split('.')))
+                    sentences = list(filter(lambda x: len(x.split(' ')) > 2, example.split('.')))
 
                     if len(sentences) == 2:
-                        german_sample_sentence, rough_english_sentence = sentences[0] + '.', sentences[1] + '.'
+                        german_sample_sentence, rough_english_sentence = format_sentence(sentences[0]), format_sentence(
+                            sentences[1])
                         fetched_sentences = True
                         break
 
@@ -159,33 +256,32 @@ def scrap_wiktionary(word):
 
     english_meaning, english_secondary_meanings = english_meanings[0], ', '.join(english_meanings[1:])
 
-    return [german_entry, german_sample_sentence, ' ', english_meaning, english_secondary_meanings, rough_english_sentence]
+    return [german_entry, german_sample_sentence, ' ', english_meaning, english_secondary_meanings,
+            rough_english_sentence]
 
 
 def main(write_failed):
-    words_file = open('words.txt', 'r+')
+    words_file = open('failed_words.txt', 'r+', encoding='utf8')
+    failed = open('failed.txt', 'w+', encoding='utf8')
+    csv = open('result.csv', 'w+', encoding='utf8')
+
     words = words_file.read().split('\n')
-    words_file.close()
-
-    failed_words = []
-
-    csv = open('result.csv', 'w+')
     for word in words:
         # info = scrap_linguee(filter_word(word))
-        info = scrap_wiktionary(filter_word(word))
+        # info = scrap_wiktionary(word)
+        # info = scrap_dictcc(word)
+        info = scrap_reverso(word)
         if info:
-            csv.write(",".join(info) + '\n')
+            csv.write(";".join([x.replace(';', '') for x in info]) + '\n')
             logger.info(f"Scrapped from Wiktionary\t{' | '.join(info)}")
         else:
             logger.warning(f"Skipped word\t{word}")
-            failed_words.append(word)
-    csv.close()
+            if write_failed:
+                failed.write(word + '\n')
 
-    if write_failed:
-        failed = open('failed.txt', 'w+')
-        for failed_word in failed_words:
-            failed.write(failed_word + '\n')
-        failed.close()
+    csv.close()
+    failed.close()
+    words_file.close()
 
 
 if __name__ == '__main__':
