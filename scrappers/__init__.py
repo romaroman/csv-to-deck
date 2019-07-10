@@ -1,0 +1,1 @@
+from .info import scrap_reverso
