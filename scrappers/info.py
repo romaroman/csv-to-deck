@@ -1,14 +1,15 @@
 import time
-from copy import deepcopy
-
+from google.cloud import translate_v3beta1 as translate
 from helpers import get_logger
 import requests
 from bs4 import BeautifulSoup
 from wiktionaryparser import WiktionaryParser
 import re
-import numpy as np
+import os
 
 
+os.environ['GOOGLE_APPLICATION_CREDENTIALS']='.google/default-ce-d2e59ab3fd13.json'
+translate_client = translate.TranslationServiceClient()
 logger = get_logger(__name__)
 wiktionary_parser = WiktionaryParser()
 wiktionary_parser.set_default_language('english')
@@ -245,3 +246,10 @@ def scrap_wiktionary(word):
             rough_english_sentence]
 
 
+def translate_with_google_api(entry):
+    result = translate_client.translate_text([entry], target_language_code='en')
+    return result
+
+
+if __name__ == '__main__':
+    print(translate_with_google_api('gehen'))
